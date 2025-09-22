@@ -1,10 +1,13 @@
 # --- STREAMLIT CLOUD SAFE BOOT HEADER ---
 import os
-os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"  # 권한 이슈 방지(Cloud)
+os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)  # ← 폴더 보장 (중요)
 import matplotlib
-matplotlib.use("Agg")  # 헤드리스 백엔드
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+import streamlit as st
+st.set_page_config(page_title="SST Classroom Dashboard", layout="wide")
 # -----------------------------------------
-
 import io
 import zipfile
 from datetime import datetime
@@ -519,3 +522,4 @@ try:
 except Exception as e:
     st.error("앱 실행 중 예외가 발생했습니다.")
     st.exception(e)
+
