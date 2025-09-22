@@ -1,139 +1,79 @@
-# --- STREAMLIT CLOUD SAFE BOOT HEADER ---
-import os
-os.environ["MPLCONFIGDIR"] = "/tmp/matplotlib"
-os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)  # ← 폴더 보장 (중요)
-import matplotlib
-matplotlib.use("Agg")  # headless
-import matplotlib.pyplot as plt
-import streamlit as st
-st.set_page_config(page_title="SST Classroom Dashboard", layout="wide")
-# -----------------------------------------
-import io
-import zipfile
+# -*- coding: utf-8 -*-
+# Teacher Dashboard: Satellite SST + Generative-AI Friendly
+# 요구 패키지: streamlit, netCDF4, numpy, matplotlib, pandas
+
+import io, zipfile, urllib.request
 from datetime import datetime
+from typing import Optional, Tuple
+
 import numpy as np
+import pandas as pd
+import streamlit as st
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import streamlit as st
+from netCDF4 import Dataset, num2date
 
-# ==============================
-# UI 기본 설정
-# ==============================
-st.set_page_config(page_title="SST Classroom Dashboard", layout="wide")
-st.title("SST Classroom Dashboard – Teacher")
+st.set_page_config(page_title="SST Classroom Dashboard (Teacher)", layout="wide")
 
-st.caption("lat=720, lon=1440 가정. time=1(하루) 또는 365(연간 일자료) 대응. 업로드 제한이 크면 URL 또는 ZIP도 가능.")
-
-# ==============================
+# =========================
 # 유틸 함수
-# ==============================
-def to_py_dt(time_like):
-    """cftime → datetime(표준 파이썬)로 변환. 실패하면 None."""
+# =========================
+def to_python_datetimes(time_like):
+    """cftime / python datetime → python datetime 리스트"""
     if time_like is None:
         return None
     out = []
     for d in time_like:
-        try:
-            # cftime이나 numpy.datetime64 모두 처리
-            y = int(getattr(d, "year", str(d)[:4]))
-            m = int(getattr(d, "month", str(d)[5:7]))
-            dd = int(getattr(d, "day", str(d)[8:10]))
-            h = int(getattr(d, "hour", 0))
-            mi = int(getattr(d, "minute", 0))
-            s = int(getattr(d, "second", 0))
-            out.append(datetime(y, m, dd, h, mi, s))
-        except Exception:
-            return None
+        if hasattr(d, "year") and hasattr(d, "month") and hasattr(d, "day"):
+            out.append(datetime(int(d.year), int(d.month), int(d.day),
+                                int(getattr(d, "hour", 0)),
+                                int(getattr(d, "minute", 0)),
+                                int(getattr(d, "second", 0))))
+        else:
+            out.append(d)
     return out
 
-def wrap_sort_lon(lon):
-    """경도를 -180~180으로 변환하고 정렬 인덱스를 반환."""
+def wrap_and_sort_lon(lon):
+    """경도 0–360 → -180–180 래핑 후 정렬"""
     lon_wrapped = (lon + 180) % 360 - 180
-    idx = np.argsort(lon_wrapped)
-    return lon_wrapped[idx], idx
+    sort_idx = np.argsort(lon_wrapped)
+    return lon_wrapped[sort_idx], sort_idx
 
 def mask_fill(arr, var):
-    """_FillValue/missing_value/비정상값을 NaN으로."""
+    """missing_value/_FillValue/비유효값 → NaN"""
     arr = np.array(arr, dtype=float, copy=True)
     fv = None
-    for k in ("missing_value", "_FillValue"):
-        if hasattr(var, k):
-            fv = getattr(var, k)
+    for key in ("missing_value", "_FillValue"):
+        if hasattr(var, key):
+            fv = getattr(var, key)
             break
     if fv is not None:
         arr[np.isclose(arr, float(fv))] = np.nan
     arr[~np.isfinite(arr)] = np.nan
     return arr
 
-def standardize_to_time_lat_lon(var, arr, lat, lon):
+def bbox_subset(lat, lon_sorted, arr_sorted, latmin, latmax, lonmin, lonmax):
     """
-    어떤 구조든 (time, lat, lon)으로 변환.
-    - 4D(예: time=1, zlev=1, lat, lon) → squeeze → 2D/3D
-    - 2D: (lat,lon)/(lon,lat) 판단
-    - 3D: (time,lat,lon)/(time,lon,lat) 판단
+    arr_sorted: (..., lat, lon) 또는 (lat, lon)
+    날짜변경선 교차(예: 170E ~ -170W)도 처리
     """
-    arr = np.asarray(arr)
-    arr = np.squeeze(arr)
-    lat_len, lon_len = len(lat), len(lon)
-    dims = tuple(getattr(var, "dimensions", ()))
-
-    if arr.ndim == 2:
-        if arr.shape == (lat_len, lon_len):    # (lat,lon)
-            return arr[None, ...]
-        if arr.shape == (lon_len, lat_len):    # (lon,lat)
-            return arr.T[None, ...]
-        # 크기 기준 추론
-        lat_axis = 0 if arr.shape[0] == lat_len else (1 if arr.shape[1] == lat_len else None)
-        lon_axis = 0 if arr.shape[0] == lon_len else (1 if arr.shape[1] == lon_len else None)
-        if None not in (lat_axis, lon_axis) and lat_axis != lon_axis:
-            return arr[None, ...] if (lat_axis, lon_axis) == (0, 1) else arr.T[None, ...]
-        raise ValueError(f"Unexpected 2D shape {arr.shape}")
-
-    if arr.ndim == 3:
-        # 빠른 크기 매칭
-        if arr.shape[1:] == (lat_len, lon_len):          # (t,lat,lon)
-            return arr
-        if arr.shape[1:] == (lon_len, lat_len):          # (t,lon,lat)
-            return np.transpose(arr, (0, 2, 1))
-        # 차원 이름 기반
-        if len(dims) == 3:
-            names = [d.lower() for d in dims]
-            t_axis = names.index("time") if "time" in names else 0
-            lat_axis = next((i for i, n in enumerate(names) if ("lat" in n) or (n in ("y", "latitude"))), None)
-            lon_axis = next((i for i, n in enumerate(names) if ("lon" in n) or (n in ("x", "longitude"))), None)
-            if None not in (t_axis, lat_axis, lon_axis):
-                return np.moveaxis(arr, (t_axis, lat_axis, lon_axis), (0, 1, 2))
-        # 최후: 크기 매칭
-        sizes = list(arr.shape)
-        lat_c = [i for i, s in enumerate(sizes) if s == lat_len]
-        lon_c = [i for i, s in enumerate(sizes) if s == lon_len]
-        if lat_c and lon_c:
-            lat_axis, lon_axis = lat_c[0], lon_c[0]
-            axes = [0, 1, 2]
-            axes.remove(lat_axis)
-            axes.remove(lon_axis)
-            t_axis = axes[0]
-            return np.moveaxis(arr, (t_axis, lat_axis, lon_axis), (0, 1, 2))
-        raise ValueError(f"Cannot standardize shape {arr.shape} to (time,lat,lon)")
-
-    raise ValueError(f"Array with ndim={arr.ndim} not supported")
-
-def subset_bbox(lat, lon_sorted, arr_sorted, latmin, latmax, lonmin, lonmax):
-    """경도 범위가 dateline(180E) 교차해도 안전하게 잘라낸다."""
     lat_mask = (lat >= latmin) & (lat <= latmax)
     if lonmin <= lonmax:
         lon_mask = (lon_sorted >= lonmin) & (lon_sorted <= lonmax)
-        return lat[lat_mask], lon_sorted[lon_mask], arr_sorted[..., lat_mask, :][..., :, lon_mask]
-    # 교차
-    m1 = lon_sorted >= lonmin
-    m2 = lon_sorted <= lonmax
-    lsub = lat[lat_mask]
-    xsub = np.concatenate([lon_sorted[m1], lon_sorted[m2]])
-    left = arr_sorted[..., lat_mask, :][..., :, m1]
-    right = arr_sorted[..., lat_mask, :][..., :, m2]
-    return lsub, xsub, np.concatenate([left, right], axis=-1)
+        return (lat[lat_mask], lon_sorted[lon_mask],
+                arr_sorted[..., lat_mask, :][..., :, lon_mask])
+    else:
+        lon_mask1 = (lon_sorted >= lonmin)
+        lon_mask2 = (lon_sorted <= lonmax)
+        lat_sub = lat[lat_mask]
+        lon_sub = np.concatenate([lon_sorted[lon_mask1], lon_sorted[lon_mask2]])
+        left  = arr_sorted[..., lat_mask, :][..., :, lon_mask1]
+        right = arr_sorted[..., lat_mask, :][..., :, lon_mask2]
+        arr_sub = np.concatenate([left, right], axis=-1)
+        return lat_sub, lon_sub, arr_sub
 
 def nan_arg_extreme_2d(arr2d, mode="max"):
+    """2D에서 NaN 무시 극값과 위치(j,i)"""
     if np.all(np.isnan(arr2d)):
         return None
     if mode == "max":
@@ -143,383 +83,458 @@ def nan_arg_extreme_2d(arr2d, mode="max"):
     j, i = np.unravel_index(idx, arr2d.shape)
     return val, j, i
 
-def fig_map(lon, lat, field2d, title, cbar="°C", vmin=None, vmax=None, cmap="jet", figsize=(7.5, 5.2)):
-    X, Y = np.meshgrid(lon, lat)
-    fig, ax = plt.subplots(figsize=figsize)
-    pc = ax.pcolormesh(X, Y, field2d, shading="auto", vmin=vmin, vmax=vmax, cmap=cmap)
-    cb = fig.colorbar(pc, ax=ax, label=cbar)
-    ax.set_title(title); ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
-    fig.tight_layout()
-    return fig
-
-def fig_ts(time_axis, values, title, ylab="°C"):
-    fig, ax = plt.subplots(figsize=(9, 3.2))
-    if time_axis is None:
-        ax.plot(values); ax.set_xlabel("time index")
-    else:
-        ax.plot(time_axis, values)
-        loc = mdates.AutoDateLocator(); ax.xaxis.set_major_locator(loc)
-        try:
-            fmt = mdates.ConciseDateFormatter(loc)
-        except Exception:
-            fmt = mdates.DateFormatter("%Y-%m")
-        ax.xaxis.set_major_formatter(fmt); fig.autofmt_xdate()
-        ax.set_xlabel("date")
-    ax.set_ylabel(ylab); ax.set_title(title)
-    fig.tight_layout()
-    return fig
-
-# ==============================
-# 안전 로더 (netCDF4 → 실패 시 xarray(h5netcdf))
-# ==============================
-class VarLike:
-    def __init__(self, data, dims, attrs):
-        self._data = np.asarray(data)
-        self.dimensions = tuple(dims)
-        for k, v in attrs.items():
-            setattr(self, k, v)
-    def __getitem__(self, idx): return self._data[idx]
-    @property
-    def shape(self): return self._data.shape
-    @property
-    def dtype(self): return self._data.dtype
-    def __array__(self): return self._data
-
-class DSLike:
-    def __init__(self, lat, lon, time, variables):
-        self.lat, self.lon, self.time = lat, lon, time
-        self.variables = variables  # dict-like: name → VarLike or netCDF4.Variable
-
-def open_nc_any(b: bytes) -> DSLike:
-    # 1) netCDF4 먼저 시도
+def format_date_axis(ax):
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
     try:
-        from netCDF4 import Dataset  # requirements에 포함
-        ds = Dataset(io.BytesIO(b))
-        lat = np.asarray(ds.variables["lat"][:])
-        lon = np.asarray(ds.variables["lon"][:])
-        time = np.asarray(ds.variables["time"][:]) if "time" in ds.variables else None
-        return DSLike(lat, lon, time, ds.variables)
+        formatter = mdates.ConciseDateFormatter(locator)
     except Exception:
-        pass
+        formatter = mdates.DateFormatter("%Y-%m")
+    ax.xaxis.set_major_formatter(formatter)
+    ax.figure.autofmt_xdate()
 
-    # 2) 실패 시 xarray(h5netcdf)
-    import xarray as xr
-    d = xr.open_dataset(io.BytesIO(b), engine="h5netcdf")
-    lat = np.asarray(d["lat"].values)
-    lon = np.asarray(d["lon"].values)
-    time = np.asarray(d["time"].values) if "time" in d.variables else None
+def fig_to_png_bytes(fig) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+    buf.seek(0)
+    return buf.read()
 
-    vars_dict = {}
-    for name, v in d.variables.items():
-        if name in ("lat", "lon", "time"):
-            continue
-        vars_dict[name] = VarLike(
-            v.values,
-            tuple(str(x) for x in getattr(v, "dims", ())),
-            dict(v.attrs),
-        )
-    return DSLike(lat, lon, time, vars_dict)
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    return buf.getvalue().encode("utf-8")
 
-# ==============================
-# 입력(업로드/URL)
-# ==============================
-with st.sidebar:
-    st.header("입력 데이터")
-    mode_in = st.radio("가져오기 방식", ["파일 업로드", "URL"], horizontal=True)
-    uploaded = None
-    url = None
-    if mode_in == "파일 업로드":
-        uploaded = st.file_uploader("NetCDF(.nc/.nc4) 또는 ZIP", type=["nc", "nc4", "zip"])
-    else:
-        url = st.text_input("NetCDF/.zip URL (HTTPS 권장)", placeholder="https://example.com/file.nc")
+def read_nc_from_bytes(data: bytes) -> Dataset:
+    """메모리에서 NetCDF 읽기"""
+    return Dataset("inmemory.nc", memory=data)
 
-    st.divider()
-    st.header("영역 선택")
-    preset = st.selectbox("프리셋", ["직접입력", "한반도 주변(20~50N, 120~150E)", "동해(35~45N, 130~142E)", "황해(30~40N, 119~126E)", "남해(32~35N, 125~130E)"])
-    if preset == "한반도 주변(20~50N, 120~150E)":
-        lat_min, lat_max, lon_min, lon_max = 20.0, 50.0, 120.0, 150.0
-    elif preset == "동해(35~45N, 130~142E)":
-        lat_min, lat_max, lon_min, lon_max = 35.0, 45.0, 130.0, 142.0
-    elif preset == "황해(30~40N, 119~126E)":
-        lat_min, lat_max, lon_min, lon_max = 30.0, 40.0, 119.0, 126.0
-    elif preset == "남해(32~35N, 125~130E)":
-        lat_min, lat_max, lon_min, lon_max = 32.0, 35.0, 125.0, 130.0
-    else:
-        lat_min = st.number_input("LAT_MIN", value=20.0, step=0.5)
-        lat_max = st.number_input("LAT_MAX", value=50.0, step=0.5)
-        lon_min = st.number_input("LON_MIN", value=120.0, step=0.5)
-        lon_max = st.number_input("LON_MAX", value=150.0, step=0.5)
-
-    st.divider()
-    st.header("모드")
-    mode = st.selectbox("분석 모드", ["특정 하루", "전체 기간", "특정 기간(월)", "특정 기간(날짜)"])
-    time_index = st.number_input("TIME_INDEX (특정 하루)", value=0, step=1)
-    m_start = st.number_input("MONTH_START", value=3, step=1, min_value=1, max_value=12)
-    m_end   = st.number_input("MONTH_END",   value=6, step=1, min_value=1, max_value=12)
-    date_start = st.text_input("DATE_START (YYYY-MM-DD)", value="2014-03-01")
-    date_end   = st.text_input("DATE_END (YYYY-MM-DD)",   value="2014-06-30")
-
-    st.divider()
-    st.header("시각화 옵션")
-    sst_vmin = st.number_input("SST_vmin", value=-2.0, step=0.5)
-    sst_vmax = st.number_input("SST_vmax", value=32.0, step=0.5)
-    anom_cmap = st.selectbox("Anomaly colormap", ["bwr", "coolwarm", "RdBu_r", "jet"])
-
-# ==============================
-# 데이터 로드
-# ==============================
-def fetch_url(u: str) -> bytes:
-    import requests
-    r = requests.get(u, timeout=30)
-    r.raise_for_status()
-    return r.content
-
-@st.cache_data(show_spinner=False)
-def load_bytes(mode_in, uploaded, url):
-    if mode_in == "파일 업로드":
-        if not uploaded:
-            return None
-        content = uploaded.read()
-    else:
-        if not url:
-            return None
-        content = fetch_url(url)
-
-    # ZIP이면 첫 번째 .nc를 펼쳐서 사용
-    try:
-        if zipfile.is_zipfile(io.BytesIO(content)):
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                nc_names = [n for n in z.namelist() if n.lower().endswith((".nc", ".nc4"))]
+def load_dataset(uploaded_file, url: str) -> Optional[Dataset]:
+    """업로드 또는 URL에서 Dataset 로드"""
+    if uploaded_file is not None:
+        if uploaded_file.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(uploaded_file, "r") as zf:
+                nc_names = [n for n in zf.namelist() if n.lower().endswith((".nc", ".nc4"))]
                 if not nc_names:
-                    raise ValueError("ZIP 안에 .nc/.nc4 파일이 없습니다.")
-                with z.open(nc_names[0]) as f:
-                    content = f.read()
-    except Exception as e:
-        raise e
-    return content
+                    st.error("ZIP 안에 .nc/.nc4 파일이 없습니다.")
+                    return None
+                with zf.open(nc_names[0]) as f:
+                    data = f.read()
+                return read_nc_from_bytes(data)
+        else:
+            data = uploaded_file.read()
+            return read_nc_from_bytes(data)
+    elif url:
+        try:
+            with urllib.request.urlopen(url) as resp:
+                data = resp.read()
+            return read_nc_from_bytes(data)
+        except Exception as e:
+            st.error(f"URL 다운로드 중 문제: {e}")
+            return None
+    else:
+        return None
 
-content = load_bytes(mode_in, uploaded, url)
+def get_preset_box(name: str) -> Tuple[float, float, float, float]:
+    """한국 근해 프리셋 박스"""
+    presets = {
+        "직접 입력": (None, None, None, None),
+        # 대략 범위(교육용): 필요시 조정 가능
+        "한국 근해(기본)": (20.0, 50.0, 120.0, 150.0),
+        "동해(Sea of Japan)": (33.0, 50.0, 128.0, 142.0),
+        "황해(Yellow Sea)": (31.0, 40.0, 118.0, 126.0),
+        "남해(South Sea)": (32.0, 36.0, 126.0, 132.0),
+    }
+    return presets.get(name, (None, None, None, None))
 
-if content is None:
-    st.info("좌측에서 파일을 업로드하거나 URL을 입력하세요.")
-    st.stop()
-
-# ==============================
-# 파이프라인 실행 (예외는 화면에 표시)
-# ==============================
-try:
-    ds = open_nc_any(content)
-
-    # 좌표
-    lat = ds.lat
-    lon = ds.lon
-
-    # 시간 변환(있을 때)
-    time_py = None
+def try_ice_mask(ds: Dataset, sst_sub: np.ndarray, lat, lon_sorted, sort_idx, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, thr_pct: float):
+    """ice 변수(%)가 있으면 thr 이상을 NaN으로 마스킹"""
+    if "ice" not in ds.variables:
+        return sst_sub, None
     try:
-        if ds.time is not None:
-            # netCDF4가 열었을 때만 num2date 사용 가능. 실패해도 None.
-            try:
-                from netCDF4 import num2date
-                tvar_units = None
-                tvar_cal = "standard"
-                # netCDF4일 때만 변수에서 직접 읽는다(VarLike에는 없음)
-                if hasattr(ds.variables.get("time", object()), "units"):
-                    tvar_units = getattr(ds.variables["time"], "units", None)
-                if hasattr(ds.variables.get("time", object()), "calendar"):
-                    tvar_cal = getattr(ds.variables["time"], "calendar", "standard")
-                if tvar_units is not None:
-                    tdt = num2date(ds.time, units=tvar_units, calendar=tvar_cal)
-                    time_py = to_py_dt(tdt)
-            except Exception:
-                time_py = None
+        ice_var = ds.variables["ice"]
+        ice = ice_var[:]
+        if ice.ndim == 2:
+            ice = ice[None, ...]
+        ice = mask_fill(ice, ice_var)
+        ice = np.squeeze(ice)
+        ice = standardize_to_time_lat_lon(ice_var, ice, lat, lon)  # ← 추가
+        ice_sorted = ice[:, :, sort_idx]
+        _, _, ice_sub = bbox_subset(lat, lon_sorted, ice_sorted, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)
+        sst_masked = sst_sub.copy()
+        # 시간 길이 맞추기(혹시 time=1 vs N)
+        tmin = min(sst_masked.shape[0], ice_sub.shape[0])
+        mask = ice_sub[:tmin] >= thr_pct
+        sst_masked[:tmin][mask] = np.nan
+        return sst_masked, ice_sub
     except Exception:
-        time_py = None
+        # ice가 이상한 경우 원본 그대로 반환
+        return sst_sub, None
+    
 
-    # 사용할 SST 변수명 탐색
-    candidates = ["sst", "analysed_sst", "sea_surface_temperature"]
-    sst_name = next((v for v in candidates if v in ds.variables), None)
-    if sst_name is None:
-        # 좌표 제외, 2D/3D/4D 그리드 첫 변수
-        sst_name = next((k for k, v in ds.variables.items()
-                         if getattr(v, "shape", ()) and k not in ("lat", "lon", "time")), None)
-    if sst_name is None:
-        st.error("SST 변수명을 찾지 못했습니다. 파일 변수 목록을 확인하세요.")
-        st.write("변수들:", list(ds.variables.keys())[:15])
+def standardize_to_time_lat_lon(var, arr, lat, lon):
+    """
+    어떤 차원 순서로 와도 sst/anom/ice를 (time, lat, lon)로 맞춰준다.
+    - 2D면 (lat, lon) 또는 (lon, lat)을 감지해서 (1, lat, lon)으로 만든다.
+    - 3D면 (time, lat, lon) 또는 (time, lon, lat) 등을 감지해 표준화한다.
+    """
+    arr = np.array(arr)
+    lat_len, lon_len = len(lat), len(lon)
+    dims = tuple(getattr(var, "dimensions", ()))  # e.g. ('time','lon','lat') 등
+
+    # 2D: (lat, lon) or (lon, lat)
+    if arr.ndim == 2:
+        if arr.shape == (lat_len, lon_len):
+            return arr[None, ...]  # (1, lat, lon)
+        if arr.shape == (lon_len, lat_len):
+            return arr.T[None, ...]  # (1, lat, lon)
+        # 이름으로도 못 맞추면 크기 기준 추론
+        lat_axis = 0 if arr.shape[0] == lat_len else (1 if arr.shape[1] == lat_len else None)
+        lon_axis = 0 if arr.shape[0] == lon_len else (1 if arr.shape[1] == lon_len else None)
+        if lat_axis is not None and lon_axis is not None and lat_axis != lon_axis:
+            if (lat_axis, lon_axis) == (0, 1):
+                return arr[None, ...]
+            if (lat_axis, lon_axis) == (1, 0):
+                return arr.T[None, ...]
+        raise ValueError(f"Unexpected 2D shape {arr.shape}; expected ({lat_len},{lon_len}) or ({lon_len},{lat_len})")
+
+    # 3D: 다양한 순서 → (time, lat, lon)로
+    if arr.ndim == 3:
+        # ① 크기만으로 빠르게 처리
+        t, a1, a2 = arr.shape
+        if (a1, a2) == (lat_len, lon_len):
+            return arr  # (time, lat, lon)
+        if (a1, a2) == (lon_len, lat_len):
+            return np.transpose(arr, (0, 2, 1))  # (time, lat, lon)
+
+        # ② 차원 이름이 있으면 이름으로 맞추기
+        if len(dims) == 3:
+            names = [d.lower() for d in dims]
+            # time, lat, lon 축 찾기 (name에 lat/lon/y/x 등 포함 가능성 고려)
+            try:
+                t_axis = names.index("time")
+            except ValueError:
+                t_axis = 0  # 못 찾으면 0 가정
+            lat_axis = next((i for i, n in enumerate(names) if ("lat" in n) or (n in ("y","latitude"))), None)
+            lon_axis = next((i for i, n in enumerate(names) if ("lon" in n) or (n in ("x","longitude"))), None)
+            if None not in (t_axis, lat_axis, lon_axis):
+                return np.moveaxis(arr, (t_axis, lat_axis, lon_axis), (0, 1, 2))
+
+        # ③ 마지막 수단: 크기 매칭으로 축 잡기
+        axes_sizes = list(arr.shape)
+        lat_cands = [i for i, s in enumerate(axes_sizes) if s == lat_len]
+        lon_cands = [i for i, s in enumerate(axes_sizes) if s == lon_len]
+        # time 축 후보: lat/lon이 아닌 나머지
+        other = [0, 1, 2]
+        if lat_cands and lon_cands:
+            # 우선 하나씩 선택
+            lat_axis = lat_cands[0]
+            lon_axis = lon_cands[0]
+            # 남은 축을 time으로
+            other.remove(lat_axis); other.remove(lon_axis)
+            t_axis = other[0]
+            return np.moveaxis(arr, (t_axis, lat_axis, lon_axis), (0, 1, 2))
+
+        raise ValueError(f"Cannot standardize shape {arr.shape} to (time, lat, lon)")
+
+    raise ValueError(f"Array with ndim={arr.ndim} not supported")
+  
+
+# =========================
+# 사이드바 UI
+# =========================
+st.sidebar.header("1) 데이터 입력")
+up = st.sidebar.file_uploader("NetCDF 업로드 (.nc / .nc4 / .zip)", type=["nc", "nc4", "zip"])
+st.sidebar.markdown("또는")
+url = st.sidebar.text_input("원격 파일 URL (HTTP/HTTPS)")
+
+st.sidebar.header("2) 해역 선택")
+preset = st.sidebar.selectbox("프리셋", ["직접 입력", "한국 근해(기본)", "동해(Sea of Japan)", "황해(Yellow Sea)", "남해(South Sea)"])
+LAT_MIN, LAT_MAX, LON_MIN, LON_MAX = get_preset_box(preset)
+if LAT_MIN is None:
+    LAT_MIN = st.sidebar.number_input("LAT_MIN", value=20.0, step=0.5)
+    LAT_MAX = st.sidebar.number_input("LAT_MAX", value=50.0, step=0.5)
+    LON_MIN = st.sidebar.number_input("LON_MIN", value=120.0, step=0.5)
+    LON_MAX = st.sidebar.number_input("LON_MAX", value=150.0, step=0.5)
+else:
+    st.sidebar.write(f"위도 {LAT_MIN}~{LAT_MAX}°, 경도 {LON_MIN}~{LON_MAX}°")
+
+st.sidebar.header("3) 분석 모드")
+mode = st.sidebar.selectbox("유형", ["특정 하루", "전체 기간", "특정 기간(월)", "특정 기간(날짜)"])
+TIME_INDEX = st.sidebar.number_input("특정 하루: TIME_INDEX (0-based)", min_value=0, value=100, step=1)
+
+MONTH_START = st.sidebar.number_input("월 시작", min_value=1, max_value=12, value=3, step=1)
+MONTH_END   = st.sidebar.number_input("월 끝",   min_value=1, max_value=12, value=6, step=1)
+DATE_START  = st.sidebar.text_input("날짜 시작 (예: 2014-03-01)", value="2014-03-01")
+DATE_END    = st.sidebar.text_input("날짜 끝 (예: 2014-06-30)", value="2014-06-30")
+
+st.sidebar.header("4) 옵션")
+SST_VMIN = st.sidebar.number_input("SST 색상 최소", value=-2.0)
+SST_VMAX = st.sidebar.number_input("SST 색상 최대", value=32.0)
+ANOM_CMAP = st.sidebar.selectbox("아노말리 컬러맵", ["bwr", "coolwarm", "RdBu_r", "jet"])
+use_ice_mask = st.sidebar.checkbox("ice ≥ 15% 마스크 적용(있을 때)", value=False)
+ice_thr = st.sidebar.slider("ice 임계값(%)", min_value=0, max_value=100, value=15, step=5, disabled=not use_ice_mask)
+
+st.sidebar.header("5) 저장")
+want_png = st.sidebar.checkbox("그림 PNG 다운로드 버튼 표시", value=True)
+want_csv = st.sidebar.checkbox("CSV 다운로드 버튼 표시", value=True)
+
+run = st.sidebar.button("실행")
+
+st.title("OISST 위성 해수면온도 자료 분석 플랫폼(교사용)")
+st.caption("lat=720, lon=1440 가정. time=1(하루) 또는 365(연간 일자료) 대응. 업로드 제한이 크면 ZIP 또는 URL 사용.")
+
+# =========================
+# 메인 로직
+# =========================
+if run:
+    ds = load_dataset(up, url)
+    if ds is None:
+        st.warning("파일을 업로드하거나 URL을 입력하세요.")
         st.stop()
 
-    sst_var = ds.variables[sst_name]
-    sst_raw = sst_var[:]
-    sst = mask_fill(sst_raw, sst_var)
-    sst = standardize_to_time_lat_lon(sst_var, sst, lat, lon)  # (time,lat,lon)
+    # 변수 읽기
+    try:
+        lat = ds.variables["lat"][:]
+        lon = ds.variables["lon"][:]
+        # sst 후보 탐색
+        cand = ["sst", "analysed_sst", "sea_surface_temperature"]
+        sst_name = next((v for v in cand if v in ds.variables), None)
+        if sst_name is None:
+            # 2D/3D 그리드형 첫 변수 사용(예외적 파일)
+            sst_name = next((k for k,v in ds.variables.items() if getattr(v, "ndim", 0) in (2,3) and k not in ("lat","lon","time")), None)
+        if sst_name is None:
+            st.error("SST 변수명을 찾을 수 없습니다. 파일 변수 목록을 확인하세요.")
+            st.stop()
+        sst_var = ds.variables[sst_name]
+        sst = sst_var[:]
+        sst = np.squeeze(sst)  
+        sst = standardize_to_time_lat_lon(sst_var, sst, lat, lon)  # ← 추가
 
-    # 경도 정렬
-    lon_sorted, sort_idx = wrap_sort_lon(lon)
+    except Exception as e:
+        st.error(f"필수 변수(lat/lon/sst) 읽기 실패: {e}")
+        st.stop()
+
+    # time → datetime
+    time_py = None
+    if "time" in ds.variables:
+        try:
+            tvar = ds.variables["time"]
+            time_vals = tvar[:]
+            time_py = to_python_datetimes(num2date(time_vals, units=getattr(tvar,"units",None),
+                                                   calendar=getattr(tvar,"calendar","standard")))
+        except Exception:
+            time_py = None
+
+    # 차원 통일
+    if sst.ndim == 2:
+        sst = sst[None, ...]  # (1, lat, lon)
+
+    # 결측/정렬/서브셋
+    sst = mask_fill(sst, sst_var)
+    lon_sorted, sort_idx = wrap_and_sort_lon(lon)
     sst_sorted = sst[:, :, sort_idx]
+    lat_sub, lon_sub, sst_sub = bbox_subset(lat, lon_sorted, sst_sorted, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)
 
-    # 메타 정보 표시
-    with st.expander("파일 요약", expanded=False):
-        st.write(f"SST shape (standardized): {sst.shape} → after sort: {sst_sorted.shape}")
-        st.write(f"lat range: {float(np.nanmin(lat))} ~ {float(np.nanmax(lat))}")
-        st.write(f"lon range (wrapped): {float(np.nanmin(lon_sorted))} ~ {float(np.nanmax(lon_sorted))}")
-        if time_py is not None:
-            st.write(f"time: {len(time_py)} steps, {time_py[0].date()} ~ {time_py[-1].date()}")
+    # ice 마스크(선택)
+    if use_ice_mask:
+        sst_sub, ice_sub = try_ice_mask(ds, sst_sub, lat, lon_sorted, sort_idx, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX, ice_thr)
+        if ice_sub is None:
+            st.info("이 파일에는 'ice' 변수가 없어 마스킹을 건너뜁니다.")
 
-    # 영역 서브셋
-    lat_sub, lon_sub, sst_sub = subset_bbox(lat, lon_sorted, sst_sorted, lat_min, lat_max, lon_min, lon_max)
+    # 데이터 개요
+    c1, c2, c3 = st.columns(3)
+    c1.metric("time", sst_sub.shape[0])
+    c2.metric("lat", sst_sub.shape[1])
+    c3.metric("lon", sst_sub.shape[2])
+    if time_py:
+        st.caption(f"날짜 범위: {time_py[0].date()} ~ {time_py[-1].date()}  (총 {len(time_py)}일)")
 
-    # -----------------------
-    # 모드별 실행
-    # -----------------------
+    # 지도 그리기 함수(다운로드 포함)
+    def show_map(field2d: np.ndarray, title: str, cbar_label: str, vmin=None, vmax=None, cmap="jet", key="map"):
+        lon2d, lat2d = np.meshgrid(lon_sub, lat_sub)
+        fig, ax = plt.subplots(figsize=(7.5, 5.5))
+        pc = ax.pcolormesh(lon2d, lat2d, field2d, shading="auto", vmin=vmin, vmax=vmax, cmap=cmap)
+        cb = fig.colorbar(pc, ax=ax, label=cbar_label)
+        ax.set_title(title)
+        ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+        fig.tight_layout()
+        st.pyplot(fig)
+        if want_png:
+            st.download_button("⬇️ PNG 저장", data=fig_to_png_bytes(fig), file_name=f"{key}.png", mime="image/png")
+        plt.close(fig)
+
+    # 시계열 그리기 함수
+    def show_timeseries(time_axis, values: np.ndarray, title: str, ylab="°C", key="ts"):
+        fig, ax = plt.subplots(figsize=(9, 3.6))
+        if time_axis is None:
+            ax.plot(values)
+            ax.set_xlabel("time index")
+        else:
+            ax.plot(time_axis, values)
+            format_date_axis(ax)
+            ax.set_xlabel("date")
+        ax.set_ylabel(ylab)
+        ax.set_title(title)
+        fig.tight_layout()
+        st.pyplot(fig)
+        if want_png:
+            st.download_button("⬇️ PNG 저장", data=fig_to_png_bytes(fig), file_name=f"{key}.png", mime="image/png")
+        plt.close(fig)
+
+    # ---------- 분석 분기 ----------
     if mode == "특정 하루":
-        ti = int(time_index)
+        ti = int(TIME_INDEX)
         if ti < 0 or ti >= sst_sub.shape[0]:
             st.error(f"TIME_INDEX {ti} 범위 오류 (0..{sst_sub.shape[0]-1})")
             st.stop()
-        label = f"t={ti}" if time_py is None else str(time_py[ti].date())
-        s2d = sst_sub[ti]
+        tlabel = f"t={ti}" if time_py is None else str(time_py[ti].date())
+        s2d = sst_sub[ti, :, :]
 
-        col1, col2 = st.columns(2)
-        with col1:
-            fig = fig_map(lon_sub, lat_sub, s2d, f"SST @ {label}", vmin=sst_vmin, vmax=sst_vmax, cmap="jet")
-            st.pyplot(fig)
-        with col2:
-            mean_reg = float(np.nanmean(s2d))
-            rmax = nan_arg_extreme_2d(s2d, "max")
-            rmin = nan_arg_extreme_2d(s2d, "min")
-            st.subheader("통계")
-            st.write(f"영역 평균: **{mean_reg:.3f} °C**")
-            if rmax:
-                st.write(f"최대: **{rmax[0]:.3f} °C** @ (lat, lon)=({lat_sub[rmax[1]]:.3f}, {lon_sub[rmax[2]]:.3f})")
-            if rmin:
-                st.write(f"최소: **{rmin[0]:.3f} °C** @ (lat, lon)=({lat_sub[rmin[1]]:.3f}, {lon_sub[rmin[2]]:.3f})")
+        # 지도
+        show_map(s2d, f"SST @ {tlabel}  ({LAT_MIN}-{LAT_MAX}N, {LON_MIN}-{LON_MAX}E)",
+                 cbar_label="SST (°C)", vmin=SST_VMIN, vmax=SST_VMAX, cmap="jet", key=f"sst_{tlabel}")
+
+        # 평균·극값
+        mean_sst = float(np.nanmean(s2d))
+        rmax = nan_arg_extreme_2d(s2d, "max")
+        rmin = nan_arg_extreme_2d(s2d, "min")
+        mcol1, mcol2, mcol3 = st.columns(3)
+        mcol1.metric("영역 평균(°C)", f"{mean_sst:.3f}")
+        if rmax: mcol2.write(f"**최대** {rmax[0]:.3f} °C @ (lat,lon)=({lat_sub[rmax[1]]:.3f}, {lon_sub[rmax[2]]:.3f})")
+        if rmin: mcol3.write(f"**최소** {rmin[0]:.3f} °C @ (lat,lon)=({lat_sub[rmin[1]]:.3f}, {lon_sub[rmin[2]]:.3f})")
 
         # 아노말리(해당 날짜의 영역 평균 기준)
-        anom_reg = s2d - mean_reg
-        fig = fig_map(lon_sub, lat_sub, anom_reg, f"Anomaly vs Regional Mean @ {label}",
-                      cbar="Anomaly (°C)", cmap=anom_cmap)
-        st.pyplot(fig)
+        anom = s2d - mean_sst
+        show_map(anom, f"Anomaly vs Regional Mean @ {tlabel}", cbar_label="Anomaly (°C)",
+                 vmin=None, vmax=None, cmap=ANOM_CMAP, key=f"anom_reg_{tlabel}")
 
-        # 제공 anom 변수도 있으면 시각화
+        # 파일 제공 anom(있다면)
         if "anom" in ds.variables:
-            try:
-                anom_var = ds.variables["anom"]
-                a = mask_fill(anom_var[:], anom_var)
-                a = standardize_to_time_lat_lon(anom_var, a, lat, lon)
-                a_sorted = a[:, :, sort_idx]
-                _, _, a_sub = subset_bbox(lat, lon_sorted, a_sorted, lat_min, lat_max, lon_min, lon_max)
-                a2d = a_sub[ti]
-                fig = fig_map(lon_sub, lat_sub, a2d, f"Provided ANOM @ {label}",
-                              cbar="Anomaly (°C)", cmap=anom_cmap)
-                st.pyplot(fig)
-            except Exception as e:
-                st.info("※ 'anom' 변수를 읽는 중 문제가 있어 건너뜀.")
-                st.exception(e)
+            anom_var = ds.variables["anom"]
+            a = anom_var[:]
+            if a.ndim == 2: a = a[None, ...]
+            a = mask_fill(a, anom_var)
+            a = np.squeeze(a) 
+            a = standardize_to_time_lat_lon(anom_var, a, lat, lon)  # ← 추가
+            a_sorted = a[:, :, sort_idx]
+            _, _, a_sub = bbox_subset(lat, lon_sorted, a_sorted, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX)
+            a2d = a_sub[ti, :, :]
+            show_map(a2d, f"Provided ANOM @ {tlabel}", cbar_label="Anomaly (°C)",
+                     vmin=None, vmax=None, cmap=ANOM_CMAP, key=f"anom_provided_{tlabel}")
         else:
-            st.info("※ 이 파일에는 'anom' 변수가 없습니다.")
+            st.info("이 파일에는 'anom' 변수가 없습니다.")
+
+        # CSV(선택): 픽셀 요약 대신, 이 날의 스칼라 요약만 제공
+        if want_csv:
+            df = pd.DataFrame({
+                "date": [tlabel],
+                "mean_C": [mean_sst],
+                "max_C": [None if rmax is None else rmax[0]],
+                "max_lat": [None if rmax is None else float(lat_sub[rmax[1]])],
+                "max_lon": [None if rmax is None else float(lon_sub[rmax[2]])],
+                "min_C": [None if rmin is None else rmin[0]],
+                "min_lat": [None if rmin is None else float(lat_sub[rmin[1]])],
+                "min_lon": [None if rmin is None else float(lon_sub[rmin[2]])],
+            })
+            st.download_button("⬇️ CSV 저장(하루 요약)", data=df_to_csv_bytes(df),
+                               file_name=f"summary_{tlabel}.csv", mime="text/csv")
 
     elif mode == "전체 기간":
         # 시계열(영역 평균)
-        mean_ts = np.nanmean(sst_sub, axis=(1, 2))
-        st.subheader("시계열 요약")
-        st.write(f"min/mean/max = {float(np.nanmin(mean_ts)):.3f} / {float(np.nanmean(mean_ts)):.3f} / {float(np.nanmax(mean_ts)):.3f} °C")
-        fig = fig_ts(to_py_dt(time_py) if time_py else None, mean_ts,
-                     f"Regional Mean SST  ({lat_min}-{lat_max}N, {lon_min}-{lon_max}E)")
-        st.pyplot(fig)
+        mean_ts = np.nanmean(sst_sub, axis=(1,2))
+        st.write("**[시계열 요약]**",
+                 f"min={float(np.nanmin(mean_ts)):.3f}, mean={float(np.nanmean(mean_ts)):.3f}, max={float(np.nanmax(mean_ts)):.3f}")
+        show_timeseries(time_py, mean_ts, f"Regional Mean SST  ({LAT_MIN}-{LAT_MAX}N, {LON_MIN}-{LON_MAX}E)", key="ts_all")
 
         # 기간 평균 지도
         mean2d = np.nanmean(sst_sub, axis=0)
-        fig = fig_map(lon_sub, lat_sub, mean2d, "Period-Mean SST", vmin=sst_vmin, vmax=sst_vmax, cmap="jet")
-        st.pyplot(fig)
+        show_map(mean2d, "Period-Mean SST", cbar_label="SST (°C)",
+                 vmin=SST_VMIN, vmax=SST_VMAX, cmap="jet", key="meanmap_all")
 
-    elif mode == "특정 기간(월)":
+        # CSV(선택): 영역평균 시계열
+        if want_csv:
+            if time_py is None:
+                df = pd.DataFrame({"time_index": np.arange(len(mean_ts)), "mean_C": mean_ts})
+            else:
+                df = pd.DataFrame({"date": [d.date().isoformat() for d in time_py], "mean_C": mean_ts})
+            st.download_button("⬇️ CSV 저장(영역평균 시계열)", data=df_to_csv_bytes(df),
+                               file_name="regional_mean_timeseries.csv", mime="text/csv")
+
+    else:  # 특정 기간(월) / 특정 기간(날짜)
         if time_py is None:
-            st.error("time 좌표가 없어 월 필터를 적용할 수 없습니다.")
+            st.error("time 좌표를 날짜로 변환할 수 없어 기간 필터를 적용할 수 없습니다.")
             st.stop()
+
         tp = np.array(time_py)
-        months = np.array([d.month for d in tp])
-        if m_start <= m_end:
-            tmask = (months >= m_start) & (months <= m_end)
+        if mode == "특정 기간(월)":
+            months = np.array([d.month for d in tp])
+            if MONTH_START <= MONTH_END:
+                tmask = (months >= MONTH_START) & (months <= MONTH_END)
+            else:  # 11~2월 같은 케이스
+                tmask = (months >= MONTH_START) | (months <= MONTH_END)
+            label_period = f"{MONTH_START}~{MONTH_END}월"
         else:
-            tmask = (months >= m_start) | (months <= m_end)
+            try:
+                y1,m1,d1 = map(int, DATE_START.split("-"))
+                y2,m2,d2 = map(int, DATE_END.split("-"))
+                start_dt = datetime(y1,m1,d1); end_dt = datetime(y2,m2,d2)
+                tmask = (tp >= start_dt) & (tp <= end_dt)
+                label_period = f"{start_dt.date()} ~ {end_dt.date()}"
+            except Exception:
+                st.error("날짜 형식이 잘못되었습니다. 예: 2014-03-01")
+                st.stop()
+
         if not np.any(tmask):
-            st.warning("선택한 월 범위에 데이터가 없습니다.")
-            st.stop()
-        sel = sst_sub[tmask]; tp = tp[tmask]
-
-        mean2d = np.nanmean(sel, axis=0)
-        fig = fig_map(lon_sub, lat_sub, mean2d, f"Period-Mean SST ({m_start}~{m_end}월)",
-                      vmin=sst_vmin, vmax=sst_vmax, cmap="jet")
-        st.pyplot(fig)
-        st.write("기간 전체 영역 평균:", float(np.nanmean(sel)))
-
-        vmax = float(np.nanmax(sel)); vmin = float(np.nanmin(sel))
-        imax = np.nanargmax(sel); t_max, j_max, i_max = np.unravel_index(imax, sel.shape)
-        imin = np.nanargmin(sel); t_min, j_min, i_min = np.unravel_index(imin, sel.shape)
-        st.write(f"최대 {vmax:.3f} °C @ {tp[t_max].date()}, (lat,lon)=({lat_sub[j_max]:.3f}, {lon_sub[i_max]:.3f})")
-        st.write(f"최소 {vmin:.3f} °C @ {tp[t_min].date()}, (lat,lon)=({lat_sub[j_min]:.3f}, {lon_sub[i_min]:.3f})")
-
-        mean_ts_sel = np.nanmean(sel, axis=(1, 2))
-        anom_reg = sel - mean_ts_sel[:, None, None]
-        fig = fig_map(lon_sub, lat_sub, anom_reg[0],
-                      f"Anomaly vs Daily Regional Mean (first day in {m_start}~{m_end}월)",
-                      cbar="Anomaly (°C)", cmap=anom_cmap)
-        st.pyplot(fig)
-
-        anom_map = sel - mean2d[None, :, :]
-        fig = fig_map(lon_sub, lat_sub, anom_map[0],
-                      f"Anomaly vs Period-Mean (first day in {m_start}~{m_end}월)",
-                      cbar="Anomaly (°C)", cmap=anom_cmap)
-        st.pyplot(fig)
-
-    elif mode == "특정 기간(날짜)":
-        if time_py is None:
-            st.error("time 좌표가 없어 날짜 필터를 적용할 수 없습니다.")
-            st.stop()
-        try:
-            y1, m1, d1 = map(int, date_start.split("-"))
-            y2, m2, d2 = map(int, date_end.split("-"))
-            start = datetime(y1, m1, d1); end = datetime(y2, m2, d2)
-        except Exception:
-            st.error("DATE_START/DATE_END 형식이 잘못되었습니다. 예: 2014-03-01")
+            st.warning(f"선택 기간({label_period})에 해당하는 데이터가 없습니다.")
             st.stop()
 
-        tp = np.array(time_py)
-        tmask = (tp >= start) & (tp <= end)
-        if not np.any(tmask):
-            st.warning("선택한 날짜 범위에 데이터가 없습니다.")
-            st.stop()
-        sel = sst_sub[tmask]; tp = tp[tmask]
+        sst_sel = sst_sub[tmask, :, :]
+        time_sel = tp[tmask]
 
-        mean2d = np.nanmean(sel, axis=0)
-        fig = fig_map(lon_sub, lat_sub, mean2d, f"Period-Mean SST ({date_start}~{date_end})",
-                      vmin=sst_vmin, vmax=sst_vmax, cmap="jet")
-        st.pyplot(fig)
-        st.write("기간 전체 영역 평균:", float(np.nanmean(sel)))
+        # 기간 평균 지도
+        mean2d = np.nanmean(sst_sel, axis=0)
+        show_map(mean2d, f"Period-Mean SST [{label_period}]", cbar_label="SST (°C)",
+                 vmin=SST_VMIN, vmax=SST_VMAX, cmap="jet", key=f"meanmap_{label_period}")
 
-        vmax = float(np.nanmax(sel)); vmin = float(np.nanmin(sel))
-        imax = np.nanargmax(sel); t_max, j_max, i_max = np.unravel_index(imax, sel.shape)
-        imin = np.nanargmin(sel); t_min, j_min, i_min = np.unravel_index(imin, sel.shape)
-        st.write(f"최대 {vmax:.3f} °C @ {tp[t_max].date()}, (lat,lon)=({lat_sub[j_max]:.3f}, {lon_sub[i_max]:.3f})")
-        st.write(f"최소 {vmin:.3f} °C @ {tp[t_min].date()}, (lat,lon)=({lat_sub[j_min]:.3f}, {lon_sub[i_min]:.3f})")
+        # 기간 전체 영역 평균(스칼라)
+        mean_scalar = float(np.nanmean(sst_sel))
+        st.metric("기간 전체 영역 평균 SST (°C)", f"{mean_scalar:.3f}")
 
-        mean_ts_sel = np.nanmean(sel, axis=(1, 2))
-        anom_reg = sel - mean_ts_sel[:, None, None]
-        fig = fig_map(lon_sub, lat_sub, anom_reg[0],
-                      f"Anomaly vs Daily Regional Mean (first day in {date_start}~{date_end})",
-                      cbar="Anomaly (°C)", cmap=anom_cmap)
-        st.pyplot(fig)
+        # 기간 내 극값(시간·공간)
+        vmax = float(np.nanmax(sst_sel)); vmin = float(np.nanmin(sst_sel))
+        idx_max = np.nanargmax(sst_sel); idx_min = np.nanargmin(sst_sel)
+        t_max, j_max, i_max = np.unravel_index(idx_max, sst_sel.shape)
+        t_min, j_min, i_min = np.unravel_index(idx_min, sst_sel.shape)
+        cmax, cmin = st.columns(2)
+        cmax.write(f"**최대** {vmax:.3f} °C  @ {time_sel[t_max].date()}, (lat,lon)=({lat_sub[j_max]:.3f}, {lon_sub[i_max]:.3f})")
+        cmin.write(f"**최소** {vmin:.3f} °C  @ {time_sel[t_min].date()}, (lat,lon)=({lat_sub[j_min]:.3f}, {lon_sub[i_min]:.3f})")
 
-        anom_map = sel - mean2d[None, :, :]
-        fig = fig_map(lon_sub, lat_sub, anom_map[0],
-                      f"Anomaly vs Period-Mean (first day in {date_start}~{date_end})",
-                      cbar="Anomaly (°C)", cmap=anom_cmap)
-        st.pyplot(fig)
+        # 아노말리 1: (시간별 영역 평균) 기준
+        mean_ts_sel = np.nanmean(sst_sel, axis=(1,2))
+        anom_regional_sel = sst_sel - mean_ts_sel[:, None, None]
+        show_map(anom_regional_sel[0], f"Anomaly vs Daily Regional Mean (first day in {label_period})",
+                 cbar_label="Anomaly (°C)", vmin=None, vmax=None, cmap=ANOM_CMAP, key=f"anom_reg_{label_period}")
 
-    else:
-        st.info("모드를 선택하세요.")
+        # 아노말리 2: (기간 평균 지도) 기준
+        anom_period_map = sst_sel - mean2d[None, :, :]
+        show_map(anom_period_map[0], f"Anomaly vs Period-Mean (first day in {label_period})",
+                 cbar_label="Anomaly (°C)", vmin=None, vmax=None, cmap=ANOM_CMAP, key=f"anom_map_{label_period}")
 
-except Exception as e:
-    st.error("앱 실행 중 예외가 발생했습니다.")
-    st.exception(e)
+        # CSV(선택): 스칼라 요약 + 기간 극값
+        if want_csv:
+            df = pd.DataFrame({
+                "period": [label_period],
+                "mean_C": [mean_scalar],
+                "max_C": [vmax],
+                "max_date": [time_sel[t_max].date().isoformat()],
+                "max_lat": [float(lat_sub[j_max])],
+                "max_lon": [float(lon_sub[i_max])],
+                "min_C": [vmin],
+                "min_date": [time_sel[t_min].date().isoformat()],
+                "min_lat": [float(lat_sub[j_min])],
+                "min_lon": [float(lon_sub[i_min])],
+            })
+            st.download_button("⬇️ CSV 저장(기간 요약)", data=df_to_csv_bytes(df),
+                               file_name=f"summary_{label_period}.csv", mime="text/csv")
 
+    ds.close()
