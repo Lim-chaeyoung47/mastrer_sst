@@ -283,7 +283,7 @@ want_csv = st.sidebar.checkbox("CSV 다운로드 버튼 표시", value=True)
 
 run = st.sidebar.button("실행")
 
-st.title("SST Classroom Dashboard — 교사용 데모")
+st.title("OISST 위성 해수면온도 수업 플랫폼(교사용)")
 st.caption("lat=720, lon=1440 가정. time=1(하루) 또는 365(연간 일자료) 대응. 업로드 제한이 크면 ZIP 또는 URL 사용.")
 
 # =========================
@@ -539,4 +539,5 @@ if run:
                                file_name=f"summary_{label_period}.csv", mime="text/csv")
 
     ds.close()
+
 
