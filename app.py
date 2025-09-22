@@ -13,6 +13,10 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from netCDF4 import Dataset, num2date
 
+import matplotlib
+matplotlib.use("Agg")  # headless backend
+import matplotlib.pyplot as plt
+
 st.set_page_config(page_title="SST Classroom Dashboard (Teacher)", layout="wide")
 
 # =========================
@@ -535,3 +539,4 @@ if run:
                                file_name=f"summary_{label_period}.csv", mime="text/csv")
 
     ds.close()
+
