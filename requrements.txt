@@ -1,5 +1,0 @@
-streamlit
-netCDF4
-numpy
-matplotlib
-pandas
