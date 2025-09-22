@@ -1,5 +1,6 @@
-streamlit
-netCDF4
-numpy
-matplotlib
-pandas
+streamlit==1.36.0
+numpy==1.26.4
+pandas==2.1.4
+matplotlib==3.8.4
+netCDF4==1.7.1.post2
+cftime==1.6.4.post1
